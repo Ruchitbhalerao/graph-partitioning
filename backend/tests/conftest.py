@@ -8,15 +8,15 @@ _tests_dir = os.path.dirname(os.path.abspath(__file__))
 if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
 
+from typing import List
 import random
-import uuid
 
 import pytest
 import networkx as nx
 import numpy as np
 
 from app.data.processor import DataProcessor
-from app.models.schemas import FTCRecord, OptimizationConfig
+from app.models.schemas import DealerRecord, FTCRecord, OptimizationConfig
 from app.models.enums import DealerType
 from app.optimization.graph_builder import DealerGraphBuilder
 from app.optimization.partitioner import TerritoryPartitioner
@@ -230,10 +230,9 @@ def refiner() -> TerritoryRefiner:
 @pytest.fixture(scope="session")
 def app():
     from app.main import create_app
-    return create_app()
+    return create_app(testing=True)
 
 
 @pytest.fixture
 def client(app):
-    from fastapi.testclient import TestClient
-    return TestClient(app)
+    return app.test_client()

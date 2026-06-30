@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     MAX_UPLOAD_SIZE_MB: int = 50
-    ALLOWED_EXTENSIONS: List[str] = [".xlsx", ".xls"]
+    ALLOWED_EXTENSIONS: List[str] = [".xlsx", ".xls", ".csv"]
 
     DEFAULT_PROXIMITY_KM: float = 5.0
     DEFAULT_TRAVEL_WEIGHT: float = 0.35

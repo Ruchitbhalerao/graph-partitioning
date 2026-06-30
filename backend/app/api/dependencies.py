@@ -1,4 +1,3 @@
-from fastapi import Depends, HTTPException, Header
 from typing import Optional
 from ..services.optimization_service import OptimizationService
 from ..services.upload_service import UploadService

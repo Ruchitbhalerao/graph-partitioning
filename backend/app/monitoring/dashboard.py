@@ -1,21 +1,20 @@
 """Monitoring dashboard — system health, metrics, and performance views.
 
-Provides FastAPI router with endpoints for:
-  - GET /monitoring/metrics — Prometheus text format
-  - GET /monitoring/health — Detailed system health
-  - GET /monitoring/performance — Recent performance snapshots
-  - GET /monitoring/logs/recent — Recent log entries (SSE or JSON)
-  - GET /monitoring/resources — CPU/memory/disk usage
-  - GET /monitoring/jobs — Job statistics
+Provides Flask Blueprint with endpoints for:
+  - GET /metrics — Prometheus text format
+  - GET /metrics/json — JSON snapshot
+  - GET /health — Detailed system health
+  - GET /performance — Recent performance snapshots
+  - GET /logs/recent — Recent log entries
+  - GET /resources — CPU/memory/disk usage
+  - GET /jobs — Job statistics
 """
 
 import json
 import time
 from datetime import datetime
-from typing import Optional, List
 
-from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from flask import Blueprint, jsonify, request, Response
 
 from .metrics import get_metrics
 from .resource import get_resource_monitor, get_temp_file_manager
@@ -24,7 +23,7 @@ from .cache import get_graph_cache, get_polygon_cache
 
 import logging
 
-router = APIRouter(prefix="/monitoring", tags=["monitoring"])
+bp = Blueprint("monitoring", __name__)
 
 _log_buffer = LogBuffer(max_entries=1000)
 
@@ -33,27 +32,27 @@ def get_log_buffer() -> LogBuffer:
     return _log_buffer
 
 
-@router.get("/metrics")
-async def metrics_endpoint():
+@bp.route("/metrics")
+def metrics_endpoint():
     """Prometheus-compatible metrics endpoint."""
     metrics = get_metrics()
     return Response(
-        content=metrics.prometheus_text(),
-        media_type="text/plain; version=0.0.4",
+        metrics.prometheus_text(),
+        mimetype="text/plain; version=0.0.4",
     )
 
 
-@router.get("/metrics/json")
-async def metrics_json():
+@bp.route("/metrics/json")
+def metrics_json():
     """JSON snapshot of all metrics."""
     metrics = get_metrics()
     snapshot = metrics.snapshot()
     snapshot["uptime_seconds"] = metrics.uptime_seconds()
-    return snapshot
+    return jsonify(snapshot)
 
 
-@router.get("/health")
-async def detailed_health():
+@bp.route("/health")
+def detailed_health():
     """Detailed system health check with component status."""
     monitor = get_resource_monitor()
     mem_mb = monitor.memory_usage_mb()
@@ -62,7 +61,7 @@ async def detailed_health():
     graph_cache = get_graph_cache()
     polygon_cache = get_polygon_cache()
 
-    return {
+    return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "memory_mb": round(mem_mb, 1),
@@ -76,23 +75,22 @@ async def detailed_health():
             "api": "up",
             "optimization_engine": "up",
         },
-    }
+    })
 
 
-@router.get("/performance")
-async def performance_snapshot():
+@bp.route("/performance")
+def performance_snapshot():
     """Current performance metrics snapshot."""
     metrics = get_metrics()
     snapshot = metrics.snapshot()
 
-    # Extract key performance indicators
     hist = snapshot.get("histograms", {})
 
     def _p95(name: str) -> float:
         h = hist.get(name, {})
         return h.get("p95", 0.0)
 
-    return {
+    return jsonify({
         "timestamp": datetime.now().isoformat(),
         "graph_build_p95_sec": _p95("graph_build_time_seconds"),
         "partition_p95_sec": _p95("partition_time_seconds"),
@@ -105,35 +103,37 @@ async def performance_snapshot():
             "graph_cache_hits": metrics.get_counter("cache_hit_total", {"type": "graph"}),
             "polygon_cache_hits": metrics.get_counter("cache_hit_total", {"type": "polygon"}),
         },
-    }
+    })
 
 
-@router.get("/logs/recent")
-async def recent_logs(n: int = Query(50, ge=1, le=500)):
+@bp.route("/logs/recent")
+def recent_logs():
     """Recent structured log entries."""
+    n = request.args.get("n", 50, type=int)
+    n = max(1, min(n, 500))
     buffer = get_log_buffer()
-    return buffer.recent(n)
+    return jsonify(buffer.recent(n))
 
 
-@router.get("/resources")
-async def system_resources():
+@bp.route("/resources")
+def system_resources():
     """Current system resource usage."""
     monitor = get_resource_monitor()
     temp_mgr = get_temp_file_manager()
-    return {
+    return jsonify({
         "timestamp": datetime.now().isoformat(),
         "memory_mb": round(monitor.memory_usage_mb(), 1),
         "cpu_percent": monitor.cpu_percent(),
         "disk_usage_bytes": temp_mgr.total_disk_usage(),
         "tracked_jobs": len(temp_mgr._tracked),
-    }
+    })
 
 
-@router.get("/jobs")
-async def job_stats():
+@bp.route("/jobs")
+def job_stats():
     """Job statistics from metrics collector."""
     metrics = get_metrics()
-    return {
+    return jsonify({
         "active_jobs": metrics.get_gauge("active_jobs"),
         "completed_jobs": metrics.get_counter("completed_jobs"),
         "error_total": metrics.get_counter("error_total"),
@@ -141,4 +141,4 @@ async def job_stats():
             metrics.get_counter("completed_jobs")
             + metrics.get_gauge("active_jobs")
         ),
-    }
+    })

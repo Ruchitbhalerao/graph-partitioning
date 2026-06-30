@@ -1,9 +1,11 @@
 import os
+import threading
 from datetime import datetime
 from typing import Optional, List
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query, Body, Request, BackgroundTasks
-from fastapi.responses import JSONResponse, StreamingResponse
 
+from flask import Blueprint, request, jsonify, Response, send_file
+
+from ..config import settings
 from ..models.schemas import (
     UploadResponse, ValidationErrorItem, OptimizationConfig,
     OptimizationStatusResponse, OptimizationResult,
@@ -21,183 +23,179 @@ from .dependencies import (
     get_export_service,
 )
 
-router = APIRouter(prefix="/api/v1", tags=["territory-optimization"])
+bp = Blueprint("api", __name__)
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 
-@router.post("/upload", response_model=UploadResponse)
-async def upload_file(
-    file: UploadFile = File(...),
-    opt_service: OptimizationService = Depends(get_optimization_service),
-    upload_service: UploadService = Depends(get_upload_service),
-):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
+def _get_json_body():
+    return request.get_json(silent=True) or {}
 
-    content = await file.read()
+
+@bp.route("/upload", methods=["POST"])
+def upload_file():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "No file provided"}), 400
+
+    content = file.read()
     if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large ({len(content) / 1024 / 1024:.1f} MB). Max {MAX_UPLOAD_BYTES / 1024 / 1024:.0f} MB.",
-        )
+        return jsonify({
+            "error": f"File too large ({len(content) / 1024 / 1024:.1f} MB). "
+                     f"Max {MAX_UPLOAD_BYTES / 1024 / 1024:.0f} MB."
+        }), 413
+
+    opt_service = get_optimization_service()
+    upload_service = get_upload_service()
 
     result = upload_service.process_upload(content, file.filename)
     upload_job_id = result.job_id
 
-    if result.status in ("validated", "validation_failed"):
-        job_id = await opt_service.start_optimization()
-        upload_job = upload_service.get_job(upload_job_id)
-        opt_service.set_job_data(
-            job_id=job_id,
-            dealers=upload_job.get("dealers", []) if upload_job else [],
-            ftcs=upload_job.get("ftcs", []) if upload_job else [],
-            rels=upload_job.get("rels", []) if upload_job else [],
-            status=result.status,
-        )
-        result.job_id = job_id
+    job_id = opt_service.start_optimization()
+    upload_job = upload_service.get_job(upload_job_id)
+    opt_service.set_job_data(
+        job_id=job_id,
+        dealers=upload_job.get("dealers", []) if upload_job else [],
+        ftcs=upload_job.get("ftcs", []) if upload_job else [],
+        rels=upload_job.get("rels", []) if upload_job else [],
+        status=result.status,
+    )
+    result.job_id = job_id
 
-    return result
+    return jsonify(result.model_dump()), 200
 
 
-@router.post("/optimize/{job_id}", response_model=OptimizationResult)
-async def run_optimization(
-    job_id: str,
-    config: Optional[OptimizationConfig] = Body(None),
-    service: OptimizationService = Depends(get_optimization_service),
-):
-    if config:
+@bp.route("/optimize/<job_id>", methods=["POST"])
+def run_optimization(job_id: str):
+    service = get_optimization_service()
+    body = _get_json_body()
+    config_data = body if body else None
+
+    config = None
+    if config_data:
+        config = OptimizationConfig(**config_data)
         weights = [
             config.travel_weight, config.workload_weight,
             config.compactness_weight, config.productivity_weight,
         ]
         if abs(sum(weights) - 1.0) > 0.01:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Weights must sum to 1.0 (got {sum(weights):.2f})",
-            )
-    return await service.run_optimization(job_id, config)
+            return jsonify({
+                "error": f"Weights must sum to 1.0 (got {sum(weights):.2f})"
+            }), 422
+
+    # Run optimization in background thread
+    def _run():
+        service.run_optimization(job_id, config)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    return jsonify({"job_id": job_id, "status": "started"}), 200
 
 
-@router.get("/optimize/progress/{job_id}")
-async def optimization_progress_stream(
-    job_id: str,
-    service: OptimizationService = Depends(get_optimization_service),
-):
-    return StreamingResponse(
+@bp.route("/optimize/progress/<job_id>")
+def optimization_progress_stream(job_id: str):
+    service = get_optimization_service()
+    response = Response(
         service.progress_stream(job_id),
-        media_type="text/event-stream",
+        mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
+    response.direct_passthrough = True
+    return response
 
 
-@router.post("/optimize/cancel/{job_id}")
-async def cancel_optimization(
-    job_id: str,
-    service: OptimizationService = Depends(get_optimization_service),
-):
-    cancelled = await service.cancel_optimization(job_id)
+@bp.route("/optimize/cancel/<job_id>", methods=["POST"])
+def cancel_optimization(job_id: str):
+    service = get_optimization_service()
+    cancelled = service.cancel_optimization(job_id)
     if not cancelled:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No running optimization found for job {job_id}",
-        )
-    return {"job_id": job_id, "status": "cancelled"}
+        return jsonify({"error": f"No running optimization found for job {job_id}"}), 404
+    return jsonify({"job_id": job_id, "status": "cancelled"}), 200
 
 
-@router.get("/optimize/history/{job_id}")
-async def get_optimization_history(
-    job_id: str,
-    service: OptimizationService = Depends(get_optimization_service),
-):
-    history = await service.get_refiner_history(job_id)
-    return {"job_id": job_id, "refiner_iterations": history}
+@bp.route("/optimize/history/<job_id>")
+def get_optimization_history(job_id: str):
+    service = get_optimization_service()
+    history = service.get_refiner_history(job_id)
+    return jsonify({"job_id": job_id, "refiner_iterations": history})
 
 
-@router.get("/status/{job_id}", response_model=OptimizationStatusResponse)
-async def get_status(
-    job_id: str,
-    service: OptimizationService = Depends(get_optimization_service),
-):
-    status = await service.get_status(job_id)
+@bp.route("/status/<job_id>")
+def get_status(job_id: str):
+    service = get_optimization_service()
+    status = service.get_status(job_id)
     if not status:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    return status
+        return jsonify({"error": f"Job {job_id} not found"}), 404
+    return jsonify(status.model_dump())
 
 
-@router.get("/result/{job_id}")
-async def get_result(
-    job_id: str,
-    service: OptimizationService = Depends(get_optimization_service),
-):
-    result = await service.get_result(job_id)
+@bp.route("/result/<job_id>")
+def get_result(job_id: str):
+    service = get_optimization_service()
+    result = service.get_result(job_id)
     if not result:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} result not found")
-    return result
+        return jsonify({"error": f"Job {job_id} result not found"}), 404
+    return jsonify(result)
 
 
-@router.get("/job/{job_id}")
-async def get_job_details(
-    job_id: str,
-    service: OptimizationService = Depends(get_optimization_service),
-):
-    details = await service.get_job_details(job_id)
+@bp.route("/job/<job_id>")
+def get_job_details(job_id: str):
+    service = get_optimization_service()
+    details = service.get_job_details(job_id)
     if not details:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    return details
+        return jsonify({"error": f"Job {job_id} not found"}), 404
+    return jsonify(details)
 
 
-@router.get("/export/{job_id}")
-async def export_results(
-    job_id: str,
-    format: str = Query("geojson", description="Export format: geojson, shapefile, csv"),
-    include_routes: bool = Query(False),
-    service: OptimizationService = Depends(get_optimization_service),
-    export_service: ExportService = Depends(get_export_service),
-):
+@bp.route("/export/<job_id>")
+def export_results(job_id: str):
+    service = get_optimization_service()
+    export_service = get_export_service()
+
+    fmt = request.args.get("format", "geojson")
+    include_routes = request.args.get("include_routes", "false").lower() == "true"
+
     valid_formats = {"geojson", "shapefile", "csv"}
-    if format not in valid_formats:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid format '{format}'. Valid: {', '.join(valid_formats)}",
-        )
+    if fmt not in valid_formats:
+        return jsonify({
+            "error": f"Invalid format '{fmt}'. Valid: {', '.join(valid_formats)}"
+        }), 400
 
-    export_files = await service.get_export(job_id, include_routes)
+    export_files = service.get_export(job_id, include_routes)
     if not export_files:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No export data found for job {job_id}",
-        )
+        return jsonify({"error": f"No export data found for job {job_id}"}), 404
 
     file_type_map = {
         "geojson": "territories_geojson",
         "shapefile": "shapefile_zip",
         "csv": "assignments_csv",
     }
-    target_key = file_type_map.get(format, "territories_geojson")
+    target_key = file_type_map.get(fmt, "territories_geojson")
 
     file_response = export_service.get_export_file(export_files, target_key)
     if not file_response:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Export file not available for format '{format}'",
-        )
+        return jsonify({
+            "error": f"Export file not available for format '{fmt}'"
+        }), 404
     return file_response
 
 
-@router.get("/analytics/{job_id}", response_model=AnalyticsReport)
-async def get_analytics(
-    job_id: str,
-    service: OptimizationService = Depends(get_optimization_service),
-    analytics_service: AnalyticsService = Depends(get_analytics_service),
-):
-    result = await service.get_result(job_id)
+@bp.route("/analytics/<job_id>")
+def get_analytics(job_id: str):
+    service = get_optimization_service()
+    analytics_service = get_analytics_service()
+
+    result = service.get_result(job_id)
     if not result:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} result not found")
+        return jsonify({"error": f"Job {job_id} result not found"}), 404
 
     job = None
     for jid, jdata in service.jobs.items():
@@ -206,47 +204,41 @@ async def get_analytics(
             break
 
     if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        return jsonify({"error": f"Job {job_id} not found"}), 404
 
-    return analytics_service.generate_report(
+    report = analytics_service.generate_report(
         result, job.get("dealers", []), job.get("ftcs", [])
     )
+    return jsonify(report.model_dump())
 
 
-@router.get("/territories/{job_id}")
-async def get_territories_geojson(
-    job_id: str,
-    service: OptimizationService = Depends(get_optimization_service),
-):
-    geojson = await service.get_territories_geojson(job_id)
+@bp.route("/territories/<job_id>")
+def get_territories_geojson(job_id: str):
+    service = get_optimization_service()
+    geojson = service.get_territories_geojson(job_id)
     if not geojson:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No territory data found for job {job_id}",
-        )
-    return JSONResponse(content=geojson)
+        return jsonify({"error": f"No territory data found for job {job_id}"}), 404
+    return jsonify(geojson)
 
 
-@router.post("/export/{job_id}/generate")
-async def generate_exports(
-    job_id: str,
-    include_routes: bool = Query(False),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
-    service: OptimizationService = Depends(get_optimization_service),
-    export_service: ExportService = Depends(get_export_service),
-):
-    job = await service.get_job_details(job_id)
+@bp.route("/export/<job_id>/generate", methods=["POST"])
+def generate_exports(job_id: str):
+    service = get_optimization_service()
+    export_service = get_export_service()
+
+    include_routes = request.args.get("include_routes", "false").lower() == "true"
+
+    job = service.get_job_details(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        return jsonify({"error": f"Job {job_id} not found"}), 404
     if job.get("status") not in ("completed",):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Job status is '{job.get('status')}', must be 'completed'",
-        )
+        return jsonify({
+            "error": f"Job status is '{job.get('status')}', must be 'completed'"
+        }), 400
 
-    result = await service.get_result(job_id)
+    result = service.get_result(job_id)
     if not result:
-        raise HTTPException(status_code=404, detail="No result found")
+        return jsonify({"error": "No result found"}), 404
 
     results_dict = result.get("results", {})
 
@@ -257,18 +249,32 @@ async def generate_exports(
             break
 
     if not jd:
-        raise HTTPException(status_code=404, detail="Job data not found")
+        return jsonify({"error": "Job data not found"}), 404
 
     dealers = jd.get("dealers", [])
     ftcs = jd.get("ftcs", [])
 
+    if not results_dict:
+        return jsonify({
+            "job_id": job_id,
+            "status": "error",
+            "error": "No optimization results to export. The data may have had no valid dealer records.",
+        }), 400
+
     from ..geography.qgis_exporter import QGISExporter
     exporter = QGISExporter(output_dir=settings.OUTPUT_DIR)
-    export_files = exporter.export_all(
-        job_id, results_dict, dealers, ftcs,
-        include_routes=include_routes,
-        style_info={"config": job.get("config")},
-    )
+    try:
+        export_files = exporter.export_all(
+            job_id, results_dict, dealers, ftcs,
+            include_routes=include_routes,
+            style_info={"config": job.get("config")},
+        )
+    except Exception as e:
+        return jsonify({
+            "job_id": job_id,
+            "status": "error",
+            "error": f"Export generation failed: {e}",
+        }), 500
 
     export_service.job_manager.set_status(job_id, {
         "job_id": job_id,
@@ -283,98 +289,85 @@ async def generate_exports(
         for k, v in export_files.items() if os.path.exists(v)
     ]
 
-    return {
+    return jsonify({
         "job_id": job_id,
         "status": "completed",
         "files": files_list,
         "total_size": sum(f["size"] for f in files_list),
         "manifest": export_files.get("manifest_json"),
-    }
+    })
 
 
-@router.get("/export/{job_id}/status")
-async def get_export_status(
-    job_id: str,
-    export_service: ExportService = Depends(get_export_service),
-):
+@bp.route("/export/<job_id>/status")
+def get_export_status(job_id: str):
+    export_service = get_export_service()
     status = export_service.get_export_status(job_id)
     if not status:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No exports found for job {job_id}",
-        )
-    return status
+        return jsonify({"error": f"No exports found for job {job_id}"}), 404
+    return jsonify(status)
 
 
-@router.get("/export/{job_id}/validate")
-async def validate_exports(
-    job_id: str,
-    export_service: ExportService = Depends(get_export_service),
-):
+@bp.route("/export/<job_id>/validate")
+def validate_exports(job_id: str):
+    export_service = get_export_service()
     report = export_service.validate_exports(job_id)
     if "error" in report:
-        raise HTTPException(status_code=404, detail=report["error"])
-    return report
+        return jsonify({"error": report["error"]}), 404
+    return jsonify(report)
 
 
-@router.get("/export/{job_id}/files")
-async def list_export_files(
-    job_id: str,
-    export_service: ExportService = Depends(get_export_service),
-):
+@bp.route("/export/<job_id>/files")
+def list_export_files(job_id: str):
+    export_service = get_export_service()
     files = export_service.list_export_files(job_id)
-    return {"job_id": job_id, "files": files}
+    return jsonify({"job_id": job_id, "files": files})
 
 
-@router.post("/export/bulk")
-async def bulk_export(
-    job_ids: List[str] = Body(...),
-    formats: List[str] = Body(["geojson", "csv", "zip"]),
-    export_service: ExportService = Depends(get_export_service),
-):
+@bp.route("/export/bulk", methods=["POST"])
+def bulk_export():
+    export_service = get_export_service()
+    body = _get_json_body()
+    if not body:
+        return jsonify({"error": "Request body required"}), 400
+
+    job_ids = body.get("job_ids", [])
+    formats = body.get("formats", ["geojson", "csv", "zip"])
+
     result = export_service.generate_bulk_export(job_ids, formats)
     if not result:
-        raise HTTPException(
-            status_code=404,
-            detail="No export data found for the specified jobs",
-        )
-    return result
+        return jsonify({
+            "error": "No export data found for the specified jobs"
+        }), 404
+    return jsonify(result)
 
 
-@router.get("/export/bulk/{bulk_id}")
-async def download_bulk_export(
-    bulk_id: str,
-    export_service: ExportService = Depends(get_export_service),
-):
+@bp.route("/export/bulk/<bulk_id>")
+def download_bulk_export(bulk_id: str):
+    export_service = get_export_service()
     bulk_dir = os.path.join(settings.OUTPUT_DIR, bulk_id)
     response = export_service.get_bulk_export_zip(bulk_dir)
     if not response:
-        raise HTTPException(status_code=404, detail="Bulk export not found")
+        return jsonify({"error": "Bulk export not found"}), 404
     return response
 
 
-@router.get("/jobs")
-async def list_jobs(
-    service: OptimizationService = Depends(get_optimization_service),
-):
-    return await service.get_jobs_list()
+@bp.route("/jobs")
+def list_jobs():
+    service = get_optimization_service()
+    jobs = service.get_jobs_list()
+    return jsonify(jobs)
 
 
-@router.get("/export/{job_id}/{file_type}")
-async def get_export_file(
-    job_id: str,
-    file_type: str,
-    service: OptimizationService = Depends(get_optimization_service),
-    export_service: ExportService = Depends(get_export_service),
-):
-    export_files = await service.get_export(job_id)
+@bp.route("/export/<job_id>/<file_type>")
+def get_export_file(job_id: str, file_type: str):
+    service = get_optimization_service()
+    export_service = get_export_service()
+
+    export_files = service.get_export(job_id)
     if not export_files:
-        raise HTTPException(status_code=404, detail="No exports found")
+        return jsonify({"error": "No exports found"}), 404
 
     file_response = export_service.get_export_file(export_files, file_type)
     if not file_response:
-        raise HTTPException(
-            status_code=404,
-            detail=f"File type '{file_type}' not available",
-        )
+        return jsonify({"error": f"File type '{file_type}' not available"}), 404
     return file_response

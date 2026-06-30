@@ -38,8 +38,9 @@ class TestOptimizationEngine:
         assert result["status"] == "completed"
 
     def test_empty_input(self, engine):
-        with pytest.raises(ValueError):
-            engine.run([], [], [])
+        result = engine.run([], [], [])
+        assert result["status"] == "completed"
+        assert result["results"] == {}
 
     def test_only_static_dealers(self, engine, mixed_dealers, mixed_ftcs):
         """Engine should handle all-static case."""

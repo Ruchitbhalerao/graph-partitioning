@@ -2,13 +2,12 @@ import os
 import json
 import csv
 import zipfile
-import asyncio
 import threading
 import shutil
 import time
 from typing import Dict, Optional, List, Any, Set
 from datetime import datetime, timedelta
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from flask import send_file, Response
 from ..config import settings
 from ..models.schemas import DealerRecord, FTCRecord
 
@@ -28,7 +27,7 @@ class ExportJobManager:
         self.output_dir = output_dir
         self._locks: Dict[str, threading.Lock] = {}
         self._status: Dict[str, Dict] = {}
-        self._completion_events: Dict[str, asyncio.Event] = {}
+        self._completion_events: Dict[str, threading.Event] = {}
 
     def _lock(self, key: str) -> threading.Lock:
         if key not in self._locks:
@@ -258,7 +257,7 @@ class ExportService:
         self,
         export_files: Dict[str, str],
         file_type: str = "territories_geojson",
-    ) -> Optional[FileResponse]:
+    ):
         filepath = export_files.get(file_type)
         if not filepath or not os.path.exists(filepath):
             return None
@@ -266,10 +265,11 @@ class ExportService:
         ext = filepath.rsplit(".", 1)[-1] if "." in filepath else ""
         media_type = EXPORT_MEDIA_TYPES.get(f".{ext}", "application/octet-stream")
 
-        return FileResponse(
-            path=filepath,
-            media_type=media_type,
-            filename=os.path.basename(filepath),
+        return send_file(
+            filepath,
+            mimetype=media_type,
+            as_attachment=True,
+            download_name=os.path.basename(filepath),
         )
 
     def read_geojson(self, filepath: str) -> Optional[Dict]:
@@ -373,7 +373,7 @@ class ExportService:
 
         return {"bulk_id": bulk_id, "bulk_dir": bulk_dir}
 
-    def get_bulk_export_zip(self, bulk_dir: str) -> Optional[Response]:
+    def get_bulk_export_zip(self, bulk_dir: str):
         if not os.path.exists(bulk_dir):
             return None
         import tempfile
@@ -384,10 +384,11 @@ class ExportService:
                 if os.path.isfile(fpath):
                     zf.write(fpath, arcname=fname)
 
-        return FileResponse(
-            path=zip_path,
-            media_type="application/zip",
-            filename=f"{os.path.basename(bulk_dir)}.zip",
+        return send_file(
+            zip_path,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"{os.path.basename(bulk_dir)}.zip",
         )
 
     def cleanup_old_exports(self, max_age_hours: int = 24):

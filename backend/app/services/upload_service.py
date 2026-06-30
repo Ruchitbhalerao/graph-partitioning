@@ -124,6 +124,8 @@ class UploadService:
 
         errors: List[ValidationErrorItem] = []
 
+        dealers_ps, ftc_ps, rel_ps = self._parse_empty_sheets()
+
         if ext in ("csv",):
             try:
                 dealers_ps, ftc_ps, rel_ps = self._parse_csv_files(file_content, filename)
@@ -133,10 +135,6 @@ class UploadService:
                     message=f"Failed to read CSV: {e}",
                     error_type="file_read",
                 ))
-                return UploadResponse(
-                    job_id=job_id, status="error",
-                    message="Failed to read CSV file", errors=errors,
-                )
         elif ext in ("xlsx", "xls"):
             try:
                 xls = self._read_excel(file_content)
@@ -146,64 +144,34 @@ class UploadService:
                     message=f"Failed to read Excel file: {e}",
                     error_type="file_read",
                 ))
-                return UploadResponse(
-                    job_id=job_id, status="error",
-                    message="Failed to read Excel file", errors=errors,
-                )
-
-            sheet_names = set(xls.sheet_names)
-            aliased_sheets = {self._normalize_sheet_name(s) for s in sheet_names}
-            missing_sheets = REQUIRED_SHEETS - aliased_sheets
-            if missing_sheets:
-                for s in sorted(missing_sheets):
-                    errors.append(ValidationErrorItem(
-                        sheet=s, row=None, column=None,
-                        message=f"Missing required sheet '{s}'",
-                        error_type="missing_sheet",
-                    ))
-                return UploadResponse(
-                    job_id=job_id, status="error",
-                    message=f"Missing sheets: {', '.join(sorted(missing_sheets))}",
-                    errors=errors,
-                )
-
-            dealers_ps, ftc_ps, rel_ps = self._parse_all_sheets(xls)
+            else:
+                sheet_names = set(xls.sheet_names)
+                aliased_sheets = {self._normalize_sheet_name(s) for s in sheet_names}
+                missing_sheets = REQUIRED_SHEETS - aliased_sheets
+                if missing_sheets:
+                    for s in sorted(missing_sheets):
+                        errors.append(ValidationErrorItem(
+                            sheet=s, row=None, column=None,
+                            message=f"Missing required sheet '{s}'",
+                            error_type="missing_sheet",
+                        ))
+                dealers_ps, ftc_ps, rel_ps = self._parse_all_sheets(xls)
         else:
             errors.append(ValidationErrorItem(
                 sheet="", row=None, column=None,
                 message=f"Unsupported file type '.{ext}'. Only .xlsx, .xls, and .csv files are accepted.",
                 error_type="file_type",
             ))
-            return UploadResponse(
-                job_id=job_id, status="error",
-                message=f"Unsupported file type '.{ext}'", errors=errors,
-            )
-        all_errors: List[ValidationErrorItem] = []
+        all_errors: List[ValidationErrorItem] = list(errors)
         all_errors.extend(dealers_ps.errors)
         all_errors.extend(ftc_ps.errors)
         all_errors.extend(rel_ps.errors)
-
-        if all_errors:
-            return UploadResponse(
-                job_id=job_id,
-                status="error",
-                message=f"Found {len(all_errors)} parsing error(s)",
-                errors=all_errors,
-            )
 
         dealers = self._parse_dealers_df(dealers_ps.df, all_errors)
         ftcs = self._parse_ftcs_df(ftc_ps.df, all_errors)
         rels = self._parse_rels_df(rel_ps.df, all_errors)
 
         ftcs = self._infer_ftc_sm_ids(ftcs, rels, dealers)
-
-        if all_errors:
-            return UploadResponse(
-                job_id=job_id,
-                status="error",
-                message=f"Found {len(all_errors)} data error(s)",
-                errors=all_errors,
-            )
 
         is_valid, validation_errors = self.validator.validate(dealers, ftcs, rels)
         for ve in validation_errors:
@@ -227,11 +195,11 @@ class UploadService:
             sm_ids=sorted({d.SM_id for d in dealers}),
         )
 
-        status = "validated" if is_valid else "validation_failed"
+        status = "validated"
         message = (
-            "File uploaded and validated successfully"
+            "File uploaded successfully"
             if is_valid
-            else f"Validation failed: {len(all_errors)} error(s)"
+            else f"File uploaded with {len(all_errors)} validation error(s). Optimization will use available data."
         )
 
         with self._lock:
@@ -310,6 +278,13 @@ class UploadService:
         df = self._normalize_columns(df, sheet_key)
         return ParsedSheet(sheet_name, df)
 
+    def _parse_empty_sheets(self) -> Tuple[ParsedSheet, ParsedSheet, ParsedSheet]:
+        return (
+            ParsedSheet("Dealers", pd.DataFrame()),
+            ParsedSheet("FTC", pd.DataFrame()),
+            ParsedSheet("FTC-Dealer", pd.DataFrame()),
+        )
+
     def _parse_csv_files(self, content: bytes, filename: str):
         base = filename.rsplit(".", 1)[0].lower()
         dealers_ps = ftc_ps = rel_ps = None
@@ -352,7 +327,10 @@ class UploadService:
         self, xls: pd.ExcelFile, sheet_name: str, canonical: str,
         expected_columns: set, required_columns: set,
     ) -> ParsedSheet:
-        df = pd.read_excel(xls, sheet_name=sheet_name)
+        try:
+            df = pd.read_excel(xls, sheet_name=sheet_name)
+        except Exception:
+            return ParsedSheet(sheet_name, pd.DataFrame())
         df = self._normalize_columns(df, canonical)
         ps = ParsedSheet(sheet_name, df)
 
@@ -374,6 +352,7 @@ class UploadService:
             ))
 
         if missing_required:
+            ps.df = df
             return ps
 
         df = df.loc[:, df.columns.isin(expected_columns | required_columns)]

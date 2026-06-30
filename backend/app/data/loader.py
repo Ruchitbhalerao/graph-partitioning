@@ -1,6 +1,5 @@
 from typing import Tuple, List, Dict
 import pandas as pd
-from fastapi import UploadFile, HTTPException
 from ..models.schemas import DealerRecord, FTCRecord, FTCRelationshipRecord
 from ..models.enums import DealerType, ProductGroup
 import io
@@ -10,22 +9,18 @@ class ExcelLoader:
     def __init__(self):
         self.required_sheets = {"Dealers", "FTC", "FTC-Dealer"}
 
-    async def load(self, file: UploadFile) -> Tuple[
+    def load(self, content: bytes) -> Tuple[
         List[DealerRecord], List[FTCRecord], List[FTCRelationshipRecord]
     ]:
-        content = await file.read()
         try:
             xls = pd.ExcelFile(io.BytesIO(content))
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid Excel file: {e}")
+            raise ValueError(f"Invalid Excel file: {e}")
 
         sheets = set(xls.sheet_names)
         missing = self.required_sheets - sheets
         if missing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Missing required sheets: {', '.join(missing)}"
-            )
+            raise ValueError(f"Missing required sheets: {', '.join(missing)}")
 
         dealers_df = pd.read_excel(xls, sheet_name="Dealers")
         ftc_df = pd.read_excel(xls, sheet_name="FTC")
@@ -55,10 +50,7 @@ class ExcelLoader:
         actual = set(df.columns)
         missing = required - actual
         if missing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Sheet '{sheet}' missing columns: {', '.join(missing)}"
-            )
+            raise ValueError(f"Sheet '{sheet}' missing columns: {', '.join(missing)}")
 
     def _parse_dealers(self, df: pd.DataFrame) -> List[DealerRecord]:
         df = df.fillna({

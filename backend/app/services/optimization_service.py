@@ -1,9 +1,9 @@
-from typing import Dict, Optional, List, AsyncGenerator
+from typing import Dict, Optional, List, Generator
 from datetime import datetime
 import uuid
-import asyncio
 import json
 import threading
+import queue
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
@@ -28,7 +28,7 @@ class OptimizationService:
     def __init__(self):
         self.jobs: Dict[str, Dict] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
-        self._progress_queues: Dict[str, asyncio.Queue] = {}
+        self._progress_queues: Dict[str, queue.Queue] = {}
         self._progress_events: Dict[str, List[Dict]] = {}
         self.loader = ExcelLoader()
         self.validator = DataValidator()
@@ -36,7 +36,7 @@ class OptimizationService:
         self.executor = ThreadPoolExecutor(max_workers=4)
         self._lock = threading.Lock()
 
-    async def start_optimization(
+    def start_optimization(
         self,
         file_content: bytes = b"",
         config: Optional[OptimizationConfig] = None,
@@ -55,7 +55,7 @@ class OptimizationService:
                 "refiner_history": [],
             }
             self._cancel_events[job_id] = threading.Event()
-            self._progress_queues[job_id] = asyncio.Queue(maxsize=500)
+            self._progress_queues[job_id] = queue.Queue(maxsize=500)
             self._progress_events[job_id] = []
         return job_id
 
@@ -80,7 +80,7 @@ class OptimizationService:
                     "refiner_history": [],
                 }
                 self._cancel_events[job_id] = threading.Event()
-                self._progress_queues[job_id] = asyncio.Queue(maxsize=500)
+                self._progress_queues[job_id] = queue.Queue(maxsize=500)
                 self._progress_events[job_id] = []
             self.jobs[job_id]["dealers"] = dealers
             self.jobs[job_id]["ftcs"] = ftcs
@@ -91,7 +91,7 @@ class OptimizationService:
                 else "Validation failed"
             )
 
-    async def run_optimization(
+    def run_optimization(
         self,
         job_id: str,
         config: Optional[OptimizationConfig] = None,
@@ -115,22 +115,35 @@ class OptimizationService:
         with self._lock:
             self._cancel_events[job_id] = threading.Event()
             if job_id not in self._progress_queues:
-                self._progress_queues[job_id] = asyncio.Queue(maxsize=500)
+                self._progress_queues[job_id] = queue.Queue(maxsize=500)
             if job_id not in self._progress_events:
                 self._progress_events[job_id] = []
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            self.executor,
-            partial(
-                self._run_optimization_sync,
+        try:
+            result = self._run_optimization_sync(
                 job_id,
                 job["dealers"],
                 job["ftcs"],
                 job["rels"],
                 cfg,
-            ),
-        )
+            )
+        except Exception as e:
+            error_msg = str(e)
+            with self._lock:
+                job["status"] = "error"
+                job["message"] = f"Optimization failed: {error_msg}"
+                job["completed_at"] = datetime.now()
+            self._push_progress(job_id, OptimizationProgressEvent(
+                job_id=job_id,
+                phase=OptimizationPhase.FAILED,
+                progress=0.0,
+                message=f"Optimization failed: {error_msg}",
+            ))
+            return OptimizationResult(
+                job_id=job_id,
+                status="error",
+                error=error_msg,
+            )
 
         with self._lock:
             job["status"] = result.get("status", "completed")
@@ -141,8 +154,7 @@ class OptimizationService:
             if "sm_progress" in result:
                 job["sm_progress"] = result["sm_progress"]
 
-        # Signal SSE consumers that we're done
-        await self._push_progress(job_id, OptimizationProgressEvent(
+        self._push_progress(job_id, OptimizationProgressEvent(
             job_id=job_id,
             phase=OptimizationPhase.COMPLETE,
             progress=100.0,
@@ -182,25 +194,17 @@ class OptimizationService:
                         self.jobs[job_id].setdefault("refiner_history", []).append(
                             event.refiner_iteration.model_dump()
                         )
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._push_progress(job_id, event), loop
-                    )
-                    future.result(timeout=0.5)
-            except (RuntimeError, Exception):
-                pass
+            self._push_progress(job_id, event)
 
         engine.set_progress_callback(progress_callback)
         return engine.run(dealers, ftcs, rels)
 
-    async def _push_progress(self, job_id: str, event: OptimizationProgressEvent):
-        queue = self._progress_queues.get(job_id)
-        if queue:
+    def _push_progress(self, job_id: str, event: OptimizationProgressEvent):
+        q = self._progress_queues.get(job_id)
+        if q:
             try:
-                await asyncio.wait_for(queue.put(event), timeout=1.0)
-            except asyncio.TimeoutError:
+                q.put(event, timeout=1.0)
+            except (queue.Full, Exception):
                 pass
         events = self._progress_events.get(job_id)
         if events is not None:
@@ -208,33 +212,31 @@ class OptimizationService:
             if len(events) > 5000:
                 events[:1000] = []
 
-    async def progress_stream(
+    def progress_stream(
         self, job_id: str,
-    ) -> AsyncGenerator[str, None]:
-        queue = self._progress_queues.get(job_id)
-        if not queue:
-            yield f"data: {json.dumps({'error': 'Job not found'})}\n\n"
+    ) -> Generator[bytes, None, None]:
+        q = self._progress_queues.get(job_id)
+        if not q:
+            yield f"data: {json.dumps({'error': 'Job not found'})}\n\n".encode()
             return
 
         job = self.jobs.get(job_id, {})
-        session_events = 0
         while True:
             try:
-                event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                session_events += 1
+                event = q.get(timeout=30.0)
                 data = event.model_dump_json()
-                yield f"data: {data}\n\n"
+                yield f"data: {data}\n\n".encode()
 
                 if event.phase == OptimizationPhase.COMPLETE or event.phase == OptimizationPhase.FAILED:
                     break
-            except asyncio.TimeoutError:
+            except queue.Empty:
                 status = job.get("status", "")
                 if status in ("completed", "cancelled", "error"):
-                    yield f"data: {json.dumps({'type': 'done', 'job_id': job_id})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done', 'job_id': job_id})}\n\n".encode()
                     break
-                yield f"data: {json.dumps({'type': 'heartbeat', 'job_id': job_id})}\n\n"
+                yield f"data: {json.dumps({'type': 'heartbeat', 'job_id': job_id})}\n\n".encode()
 
-    async def cancel_optimization(self, job_id: str) -> bool:
+    def cancel_optimization(self, job_id: str) -> bool:
         cancel_event = self._cancel_events.get(job_id)
         if cancel_event:
             cancel_event.set()
@@ -242,7 +244,7 @@ class OptimizationService:
                 if job_id in self.jobs:
                     self.jobs[job_id]["status"] = "cancelled"
                     self.jobs[job_id]["message"] = "Cancelled by user"
-            await self._push_progress(job_id, OptimizationProgressEvent(
+            self._push_progress(job_id, OptimizationProgressEvent(
                 job_id=job_id,
                 phase=OptimizationPhase.FAILED,
                 progress=0.0,
@@ -251,10 +253,10 @@ class OptimizationService:
             return True
         return False
 
-    async def get_progress_events(self, job_id: str) -> List[Dict]:
+    def get_progress_events(self, job_id: str) -> List[Dict]:
         return self._progress_events.get(job_id, [])
 
-    async def get_status(self, job_id: str) -> Optional[OptimizationStatusResponse]:
+    def get_status(self, job_id: str) -> Optional[OptimizationStatusResponse]:
         job = self.jobs.get(job_id)
         if not job:
             return None
@@ -267,11 +269,11 @@ class OptimizationService:
             completed_at=job.get("completed_at"),
         )
 
-    async def get_result(self, job_id: str) -> Optional[Dict]:
+    def get_result(self, job_id: str) -> Optional[Dict]:
         job = self.jobs.get(job_id)
         return job.get("result") if job else None
 
-    async def get_export(
+    def get_export(
         self, job_id: str, include_routes: bool = False,
     ) -> Optional[Dict[str, str]]:
         job = self.jobs.get(job_id)
@@ -286,7 +288,7 @@ class OptimizationService:
             job_id, results_dict, dealers, ftcs, include_routes
         )
 
-    async def get_jobs_list(self) -> list:
+    def get_jobs_list(self) -> list:
         return [
             {
                 "job_id": jid,
@@ -299,11 +301,11 @@ class OptimizationService:
             for jid, jdata in self.jobs.items()
         ]
 
-    async def get_refiner_history(self, job_id: str) -> List[Dict]:
+    def get_refiner_history(self, job_id: str) -> List[Dict]:
         job = self.jobs.get(job_id)
         return job.get("refiner_history", []) if job else []
 
-    async def get_job_details(self, job_id: str) -> Optional[Dict]:
+    def get_job_details(self, job_id: str) -> Optional[Dict]:
         job = self.jobs.get(job_id)
         if not job:
             return None
@@ -324,7 +326,7 @@ class OptimizationService:
             "refiner_iterations": len(job.get("refiner_history", [])),
         }
 
-    async def get_territories_geojson(self, job_id: str) -> Optional[Dict]:
+    def get_territories_geojson(self, job_id: str) -> Optional[Dict]:
         job = self.jobs.get(job_id)
         if not job or not job.get("result"):
             return None

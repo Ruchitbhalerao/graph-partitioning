@@ -193,6 +193,21 @@ class OptimizationEngine:
             f"Building proximity graph for {len(dealers)} dealers",
         )
 
+        if not dealers:
+            self._emit_progress(
+                OptimizationPhase.COMPLETE, 100.0,
+                "No dealers to optimize",
+            )
+            return {
+                "job_id": self.job_id,
+                "status": "completed",
+                "results": {},
+                "summary": self._generate_summary({}, dealers, ftcs),
+                "timing": [],
+                "sm_progress": {},
+                "profiling": {},
+            }
+
         # Build graph with timing and caching
         with Timer(METRIC_GRAPH_BUILD_TIME):
             G = self.graph_builder.build(dealers)
