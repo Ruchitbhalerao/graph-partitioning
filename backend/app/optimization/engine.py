@@ -194,10 +194,6 @@ class OptimizationEngine:
         )
 
         if not dealers:
-            self._emit_progress(
-                OptimizationPhase.COMPLETE, 100.0,
-                "No dealers to optimize",
-            )
             return {
                 "job_id": self.job_id,
                 "status": "completed",
@@ -254,16 +250,13 @@ class OptimizationEngine:
         if settings.ENABLE_POLYGON_CACHE:
             get_polygon_cache().clear()
 
-        # Record job completion
+        # Record job completion — do NOT emit COMPLETE here; the service
+        # stores the result first, then emits COMPLETE so that the frontend's
+        # GET /result/<job_id> returns the data before the EventSource closes.
         job_duration = time.perf_counter() - t_start
         get_metrics().observe(METRIC_JOB_DURATION, job_duration)
         get_metrics().increment(METRIC_COMPLETED_JOBS)
         get_metrics().gauge(METRIC_ACTIVE_JOBS, max(0, get_metrics().get_gauge(METRIC_ACTIVE_JOBS) - 1))
-
-        self._emit_progress(
-            OptimizationPhase.COMPLETE, 100.0,
-            f"Optimization complete in {job_duration:.1f}s",
-        )
 
         return {
             "job_id": self.job_id,

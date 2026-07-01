@@ -131,6 +131,7 @@ class OptimizationService:
             error_msg = str(e)
             with self._lock:
                 job["status"] = "error"
+                job["phase"] = OptimizationPhase.FAILED
                 job["message"] = f"Optimization failed: {error_msg}"
                 job["completed_at"] = datetime.now()
             self._push_progress(job_id, OptimizationProgressEvent(
@@ -145,21 +146,26 @@ class OptimizationService:
                 error=error_msg,
             )
 
-        with self._lock:
-            job["status"] = result.get("status", "completed")
-            job["result"] = result
-            job["completed_at"] = datetime.now()
-            if "timing" in result:
-                job["timing"] = result["timing"]
-            if "sm_progress" in result:
-                job["sm_progress"] = result["sm_progress"]
-
+        # Push COMPLETE to the queue FIRST so the SSE generator sees the
+        # event before it checks job["status"]. If we set status first, the
+        # generator could read "completed" on a timeout and send "done"
+        # before the COMPLETE event reaches the queue.
         self._push_progress(job_id, OptimizationProgressEvent(
             job_id=job_id,
             phase=OptimizationPhase.COMPLETE,
             progress=100.0,
             message="Optimization complete",
         ))
+
+        with self._lock:
+            job["status"] = result.get("status", "completed")
+            job["phase"] = OptimizationPhase.COMPLETE
+            job["result"] = result
+            job["completed_at"] = datetime.now()
+            if "timing" in result:
+                job["timing"] = result["timing"]
+            if "sm_progress" in result:
+                job["sm_progress"] = result["sm_progress"]
 
         return OptimizationResult(
             job_id=job_id,
@@ -220,16 +226,33 @@ class OptimizationService:
             yield f"data: {json.dumps({'error': 'Job not found'})}\n\n".encode()
             return
 
+        # Flush an initial event immediately so the EventSource connection is
+        # established and the browser does not time out waiting for the first byte.
         job = self.jobs.get(job_id, {})
+        initial_status = job.get("status", "")
+        if initial_status in ("completed", "cancelled", "error"):
+            yield f"data: {json.dumps({'type': 'done', 'job_id': job_id})}\n\n".encode()
+            return
+        yield f"data: {json.dumps({'type': 'connected', 'job_id': job_id})}\n\n".encode()
+
         while True:
             try:
-                event = q.get(timeout=30.0)
+                event = q.get(timeout=5.0)
                 data = event.model_dump_json()
                 yield f"data: {data}\n\n".encode()
 
-                if event.phase == OptimizationPhase.COMPLETE or event.phase == OptimizationPhase.FAILED:
+                # After sending any event, check if the job is done.
+                # The service sets job["status"] before pushing the final
+                # event, so this catches completion even if the terminal
+                # event was dropped or never pushed.
+                job = self.jobs.get(job_id, {})
+                if job.get("status") in ("completed", "cancelled", "error"):
+                    yield f"data: {json.dumps({'type': 'done', 'job_id': job_id})}\n\n".encode()
                     break
             except queue.Empty:
+                # Re-read job status each timeout — the optimization thread
+                # may have finished between our last queue read and now.
+                job = self.jobs.get(job_id, {})
                 status = job.get("status", "")
                 if status in ("completed", "cancelled", "error"):
                     yield f"data: {json.dumps({'type': 'done', 'job_id': job_id})}\n\n".encode()
@@ -243,6 +266,7 @@ class OptimizationService:
             with self._lock:
                 if job_id in self.jobs:
                     self.jobs[job_id]["status"] = "cancelled"
+                    self.jobs[job_id]["phase"] = OptimizationPhase.FAILED
                     self.jobs[job_id]["message"] = "Cancelled by user"
             self._push_progress(job_id, OptimizationProgressEvent(
                 job_id=job_id,
@@ -279,14 +303,23 @@ class OptimizationService:
         job = self.jobs.get(job_id)
         if not job or not job.get("result"):
             return None
+
+        # Return cached export files if available
+        cached = job.get("export_files")
+        if cached and not include_routes:
+            return cached
+
         result = job["result"]
         results_dict = result.get("results", {})
         dealers = job.get("dealers", [])
         ftcs = job.get("ftcs", [])
         exporter = QGISExporter(output_dir=settings.OUTPUT_DIR)
-        return exporter.export_all(
+        export_files = exporter.export_all(
             job_id, results_dict, dealers, ftcs, include_routes
         )
+        if export_files and not include_routes:
+            job["export_files"] = export_files
+        return export_files
 
     def get_jobs_list(self) -> list:
         return [

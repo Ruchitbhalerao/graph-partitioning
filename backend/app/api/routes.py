@@ -1,5 +1,6 @@
 import os
 import threading
+import zipfile
 from datetime import datetime
 from typing import Optional, List
 
@@ -108,6 +109,7 @@ def optimization_progress_stream(job_id: str):
             "X-Accel-Buffering": "no",
         },
     )
+    response.enable_chunked_encoding()
     response.direct_passthrough = True
     return response
 
@@ -276,6 +278,12 @@ def generate_exports(job_id: str):
             "error": f"Export generation failed: {e}",
         }), 500
 
+    # Update the cached export_files on the job
+    for jid, jdata in service.jobs.items():
+        if jid == job_id:
+            jdata["export_files"] = export_files
+            break
+
     export_service.job_manager.set_status(job_id, {
         "job_id": job_id,
         "status": "completed",
@@ -358,10 +366,29 @@ def list_jobs():
     return jsonify(jobs)
 
 
+@bp.route("/map/<job_id>")
+def get_interactive_map(job_id: str):
+    """Serve the interactive HTML map directly in the browser."""
+    service = get_optimization_service()
+    export_files = service.get_export(job_id)
+    if not export_files:
+        return jsonify({"error": "No exports found"}), 404
+
+    map_path = export_files.get("interactive_map")
+    if not map_path or not os.path.exists(map_path):
+        return jsonify({"error": "Interactive map not available"}), 404
+
+    return send_file(map_path, mimetype="text/html")
+
+
 @bp.route("/export/<job_id>/<file_type>")
 def get_export_file(job_id: str, file_type: str):
     service = get_optimization_service()
     export_service = get_export_service()
+
+    # "manifest_json" → download all files as a zip
+    if file_type == "manifest_json":
+        return _download_all_files(job_id, service)
 
     export_files = service.get_export(job_id)
     if not export_files:
@@ -371,3 +398,26 @@ def get_export_file(job_id: str, file_type: str):
     if not file_response:
         return jsonify({"error": f"File type '{file_type}' not available"}), 404
     return file_response
+
+
+def _download_all_files(job_id: str, service):
+    """Zip all export files and return as a downloadable response."""
+    import io
+    export_files = service.get_export(job_id)
+    if not export_files:
+        return jsonify({"error": "No exports found"}), 404
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for key, filepath in export_files.items():
+            if os.path.isfile(filepath):
+                zf.write(filepath, arcname=os.path.basename(filepath))
+    buf.seek(0)
+
+    from flask import send_file
+    return send_file(
+        buf,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"{job_id}_export.zip",
+    )

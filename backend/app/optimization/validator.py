@@ -77,6 +77,8 @@ class BusinessRuleValidator:
             if len(dealer_ids) <= 1:
                 continue
             subgraph = G.subgraph(dealer_ids)
+            if len(subgraph) == 0:
+                continue
             if not nx.is_connected(subgraph):
                 components = list(nx.connected_components(subgraph))
                 errors.append(

@@ -908,6 +908,8 @@ class TerritoryRefiner:
         if len(remaining) < 2:
             return True
         sub = state.G.subgraph(remaining)
+        if len(sub) == 0:
+            return True
         return nx.is_connected(sub)
 
     def _contiguity_after_add(

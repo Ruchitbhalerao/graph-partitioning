@@ -17,6 +17,7 @@ EXPORT_MEDIA_TYPES = {
     ".csv": "text/csv",
     ".json": "application/json",
     ".zip": "application/zip",
+    ".html": "text/html",
     ".qgs": "application/x-qgis-project",
     ".qml": "application/x-qgis-style",
 }

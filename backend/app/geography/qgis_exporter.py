@@ -171,6 +171,13 @@ class QGISExporter:
         self._export_qgis_project(job_dir, job_id)
         output_files["qgis_project"] = os.path.join(job_dir, f"{job_id}.qgs")
 
+        # Interactive HTML map
+        map_path = self.export_interactive_map(
+            job_dir, job_id, results, dealers, ftcs
+        )
+        if map_path:
+            output_files["interactive_map"] = map_path
+
         return output_files
 
     def _write_qml(self, style_dir: str, filename: str, content: str):
@@ -183,7 +190,7 @@ class QGISExporter:
     ) -> Dict:
         entries = []
         for key, path in output_files.items():
-            if os.path.exists(path):
+            if os.path.isfile(path):
                 size_bytes = os.path.getsize(path)
                 entries.append({
                     "key": key,
@@ -546,6 +553,76 @@ class QGISExporter:
             shutil.rmtree(shp_dir, ignore_errors=True)
             return zip_path
         except Exception:
+            # fiona/GDAL not available — fall back to CSV-in-zip
+            return self._export_shapefile_csv_fallback(
+                job_dir, job_id, results, dealers
+            )
+
+    def _export_shapefile_csv_fallback(
+        self, job_dir: str, job_id: str,
+        results: Dict[str, Dict], dealers: List[DealerRecord],
+    ) -> Optional[str]:
+        """Generate a zip of CSV files as a fallback when fiona/GDAL is unavailable."""
+        try:
+            shp_dir = os.path.join(job_dir, f"{job_id}_shapefile")
+            os.makedirs(shp_dir, exist_ok=True)
+
+            # Territories CSV
+            terr_path = os.path.join(shp_dir, f"{job_id}_territories.csv")
+            with open(terr_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "sm_id", "ftc_id", "dealer_count", "centroid_lat",
+                    "centroid_lon", "area_sqkm",
+                ])
+                for sm_id, sm_result in results.items():
+                    assignments = sm_result.get("assignments", {})
+                    territories = self.polygon_generator.generate_all_territories(
+                        assignments, dealers
+                    )
+                    dealer_map = {d.Dealer_id: d for d in dealers}
+                    for ftc_id, polygon in territories.items():
+                        if polygon and not polygon.is_empty:
+                            centroid = polygon.centroid
+                            dealer_ids = assignments.get(ftc_id, [])
+                            writer.writerow([
+                                sm_id, ftc_id, len(dealer_ids),
+                                round(centroid.y, 6), round(centroid.x, 6),
+                                round(polygon.area * 111.32 ** 2, 2),
+                            ])
+
+            # Dealers CSV
+            dlr_path = os.path.join(shp_dir, f"{job_id}_dealers.csv")
+            ftc_dealer_map = {}
+            for sm_result in results.values():
+                for ftc_id, dealer_ids in sm_result.get("assignments", {}).items():
+                    for d_id in dealer_ids:
+                        ftc_dealer_map[d_id] = ftc_id
+            with open(dlr_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "dealer_id", "sm_id", "dealer_type", "product_group",
+                    "cases_per_day", "latitude", "longitude", "assigned_ftc",
+                ])
+                for d in dealers:
+                    writer.writerow([
+                        d.Dealer_id, d.SM_id, d.Dealer_type.value,
+                        d.Product_group.value, d.Average_cases_per_day,
+                        d.Dealer_latitude, d.Dealer_longitude,
+                        ftc_dealer_map.get(d.Dealer_id, ""),
+                    ])
+
+            # Zip everything
+            zip_path = os.path.join(job_dir, f"{job_id}_shapefile.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for fname in sorted(os.listdir(shp_dir)):
+                    fpath = os.path.join(shp_dir, fname)
+                    zf.write(fpath, arcname=fname)
+
+            import shutil
+            shutil.rmtree(shp_dir, ignore_errors=True)
+            return zip_path
+        except Exception:
             return None
 
     def _export_metadata(
@@ -665,3 +742,135 @@ class QGISExporter:
     </projections>
   </mapcanvas>
 </qgis>""")
+
+    def export_interactive_map(
+        self,
+        job_dir: str,
+        job_id: str,
+        results: Dict[str, Dict],
+        dealers: List[DealerRecord],
+        ftcs: List[FTCRecord],
+    ) -> Optional[str]:
+        """Generate an interactive Folium HTML map of the optimization results."""
+        try:
+            import folium
+            from folium.plugins import MarkerCluster
+        except ImportError:
+            return None
+
+        # Collect all dealer coordinates to compute bounds
+        all_lats = [d.Dealer_latitude for d in dealers if d.Dealer_latitude]
+        all_lons = [d.Dealer_longitude for d in dealers if d.Dealer_longitude]
+        if not all_lats or not all_lons:
+            return None
+
+        center_lat = (min(all_lats) + max(all_lats)) / 2
+        center_lon = (min(all_lons) + max(all_lons)) / 2
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="OpenStreetMap")
+
+        COLORS = [
+            "#4a90d9", "#22c55e", "#f59e0b", "#ef4444", "#8b5cf6",
+            "#ec4899", "#14b8a6", "#f97316", "#6366f1", "#84cc16",
+            "#e11d48", "#0ea5e9", "#34d399", "#fb923c", "#a78bfa",
+        ]
+
+        dealer_map = {d.Dealer_id: d for d in dealers}
+        dealer_map_by_sm = {}
+        for d in dealers:
+            dealer_map_by_sm.setdefault(d.SM_id, []).append(d)
+
+        # SM region feature groups
+        sm_ids = sorted(results.keys())
+        for sm_idx, sm_id in enumerate(sm_ids):
+            sm_result = results.get(sm_id, {})
+            assignments = sm_result.get("assignments", {})
+            anchors = sm_result.get("anchors", {})
+            sm_color = COLORS[sm_idx % len(COLORS)]
+
+            sm_group = folium.FeatureGroup(name=f"SM: {sm_id}")
+
+            # Territory polygons
+            territories = self.polygon_generator.generate_all_territories(assignments, dealers)
+            for ftc_idx, (ftc_id, polygon) in enumerate(territories.items()):
+                if polygon and not polygon.is_empty:
+                    ftc_color = COLORS[(sm_idx + ftc_idx) % len(COLORS)]
+                    dealer_ids = assignments.get(ftc_id, [])
+                    anchor = anchors.get(ftc_id, "")
+                    total_cases = sum(
+                        d.Average_cases_per_day
+                        for d in dealers if d.Dealer_id in dealer_ids
+                    )
+
+                    # Convert polygon coords for folium (lat, lon)
+                    if polygon.geom_type == "Polygon":
+                        coords = [(c[1], c[0]) for c in polygon.exterior.coords]
+                    else:
+                        continue
+
+                    popup_html = (
+                        f"<b>SM:</b> {sm_id}<br>"
+                        f"<b>FTC:</b> {ftc_id}<br>"
+                        f"<b>Dealers:</b> {len(dealer_ids)}<br>"
+                        f"<b>Anchor:</b> {anchor or 'N/A'}<br>"
+                        f"<b>Total Cases/Day:</b> {total_cases:.1f}"
+                    )
+                    folium.Polygon(
+                        locations=coords,
+                        color=ftc_color,
+                        weight=2,
+                        fill=True,
+                        fill_color=ftc_color,
+                        fill_opacity=0.2,
+                        popup=folium.Popup(popup_html, max_width=250),
+                        tooltip=f"{sm_id} / {ftc_id}",
+                    ).add_to(sm_group)
+
+            # Dealer points
+            for d in dealer_map_by_sm.get(sm_id, []):
+                is_anchor = d.Dealer_id in [
+                    aid for aids in anchors.values() for aid in [aids] if aids
+                ]
+                is_static = d.Dealer_type == DealerType.STATIC
+                icon_color = "green" if is_static else "blue"
+                icon = "home" if is_static else "truck"
+                if is_anchor:
+                    icon_color = "red"
+                    icon = "star"
+
+                popup_html = (
+                    f"<b>Dealer:</b> {d.Dealer_id}<br>"
+                    f"<b>Type:</b> {d.Dealer_type.value.upper()}<br>"
+                    f"<b>SM:</b> {d.SM_id}<br>"
+                    f"<b>Product:</b> {d.Product_group.value}<br>"
+                    f"<b>Cases/Day:</b> {d.Average_cases_per_day:.1f}"
+                )
+                folium.Marker(
+                    location=[d.Dealer_latitude, d.Dealer_longitude],
+                    popup=folium.Popup(popup_html, max_width=250),
+                    tooltip=d.Dealer_id,
+                    icon=folium.Icon(color=icon_color, icon=icon, prefix="fa"),
+                ).add_to(sm_group)
+
+            sm_group.add_to(m)
+
+        # Layer control
+        folium.LayerControl(collapsed=False).add_to(m)
+
+        # Legend
+        legend_html = """
+        <div style="position:fixed;bottom:30px;left:30px;z-index:1000;
+            background:white;padding:10px 14px;border-radius:8px;
+            box-shadow:0 2px 6px rgba(0,0,0,0.3);font-size:12px;
+            line-height:1.6;">
+        <b>Territory Map</b><br>
+        <i style="background:#ef4444;width:12px;height:12px;display:inline-block;border-radius:50%;"></i> Anchor<br>
+        <i style="background:#22c55e;width:12px;height:12px;display:inline-block;border-radius:50%;"></i> Static Dealer<br>
+        <i style="background:#4a90d9;width:12px;height:12px;display:inline-block;border-radius:50%;"></i> Mobile Dealer<br>
+        <i style="background:rgba(74,144,217,0.2);width:12px;height:12px;display:inline-block;border:1px solid #4a90d9;"></i> Territory
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
+
+        map_path = os.path.join(job_dir, f"{job_id}_map.html")
+        m.save(map_path)
+        return map_path

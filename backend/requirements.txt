@@ -14,3 +14,4 @@ h3==4.1.0
 ortools==9.11.4210
 python-dotenv==1.0.1
 psutil==6.1.1
+folium==0.20.0
